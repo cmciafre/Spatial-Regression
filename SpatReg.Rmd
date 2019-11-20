@@ -1,0 +1,386 @@
+---
+title: Spatial Regression Analysis <br><small>Advanced Data Analytics</small></br>
+author: "BIOL 5700, Fall 2019"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+  html_notebook:
+    df_print: paged
+    highlight: kate
+    number_sections: no
+    rows.print: 10
+    theme: cerulean
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+  pdf_document: default
+editor_options:
+  chunk_output_type: inline
+---
+```{r Packages, message=FALSE, warning=FALSE, include=FALSE}
+packages<-c("cowplot", "dplyr", "geosphere", "ggplot2", "ggExtra", "maps", "maptools", "readxl", "rgdal", "rgeos", "sf", "sp", "spatialreg", "spdep", "tidyr", "viridis", "knitr", "mapproj")
+sapply(packages, require, character.only=T)
+
+data <- read.csv('./Data/childpov18_southfull.csv', 
+                   colClasses = c("character", "character", "character", 
+                                  "numeric", "numeric", "numeric", "numeric",
+                                  "numeric", "numeric", "numeric", "numeric",
+                                  "numeric", "numeric", "numeric", "numeric", 
+                                  "numeric", "numeric", "numeric", "numeric",
+                                  "numeric", "numeric", "numeric", "numeric",
+                                  "numeric", "numeric", "numeric", "numeric", 
+                                  "numeric", "numeric", "numeric", "numeric",
+                                  "numeric", "numeric", "numeric", "numeric"))
+```
+
+```{r rename variable, message=FALSE, warning=FALSE, include=FALSE}
+names(data)[names(data)=="X2016.child.poverty"] <- "child.pov.2016"
+```
+
+```{r subset the data, message=FALSE, warning=FALSE, include=FALSE}
+fl_pov <- data %>% subset(State == "FL")
+```
+
+# Ordinary Least Squares
+
+```{r ols equation, message=FALSE, warning=FALSE, echo=TRUE}
+equation <- child.pov.2016 ~ rural + urban + lnmanufacturing + lnag + 
+            lnretail + lnhealthss + lnconstruction + lnlesshs + 
+            lnunemployment + lnsinglemom + lnblack + lnhispanic + 
+            lnuninsured + lnincome_ratio + lnteenbirth + lnunmarried
+```
+
+```{r scientific notation, message=FALSE, warning=FALSE, include=FALSE}
+options(scipen = 5)
+```
+
+```{r ols, message=FALSE, warning=FALSE, echo=TRUE}
+ols <- lm(equation, data=fl_pov)
+summary(ols)
+```
+
+Nice, none of the variables are significant. Maybe there is a spatial component.
+
+# Spatial Dependency
+
+## Contiguity Neighbors
+
+```{r create neighbors, message=FALSE, warning=FALSE, echo=TRUE}
+#Obtain FIPS Codes by county 
+fips <- county.fips
+
+#Create county polygons
+florida <- map(database = "county", regions = "florida", fill=T, plot=F)
+IDs <- sub("^florida,","",florida$names)
+
+#Add FIPS codes to the county polygons
+fips.codes <- separate(data = fips, col = polyname, into = c("state", "county"), sep = ",")
+fl_fips <- subset(fips.codes, state=="florida", select=fips)
+names <- fips.codes$county
+fl_IDs <- unique(fl_fips$fips)
+
+#Create spatial polygons
+fl_sp = map2SpatialPolygons(florida,fl_fips$fips,CRS("+proj=longlat"))
+names(fl_sp@polygons) <- fl_IDs
+
+#Create neighbor weights using the queens case
+neighb.data <- poly2nb(fl_sp, queen=T)
+names(neighb.data) <- names(fl_sp@polygons)
+
+#Create list of neighbors
+cont.neighb <- nb2listw(neighb.data,style="W", zero.policy = TRUE)
+```
+
+```{r morans, message=FALSE, warning=FALSE, echo=TRUE}
+lm.morantest(ols, cont.neighb)
+```
+
+Our Moran's Test for regression residuals is significant (p=0.0078), so we  reject the null hypothesis that there is no spatial dependency present. We should use a spatial model.
+
+```{r lagrange tests, message=FALSE, warning=FALSE, echo=TRUE}
+lm.LMtests(ols, cont.neighb, test="all")
+```
+The results of the five (5) LaGrange Multiplier Tests are as follows:
+
+LMerr | LMlag | RLMerr | RLMlag | SARMA 
+----- | ----- | ------ | ------ | -----
+0.100 | 0.254 | 0.217  | 0.716  | 0.244
+
+None of these are significant. Nevertheless we shall plow ahead using a spatial error model (LMerr) because it has the lowest p-value.
+
+## Spatial Error Model
+
+```{r spatial err model Impacts, message=FALSE, warning=FALSE, echo=TRUE}
+sp.err.model <- spatialreg::errorsarlm(equation, data=fl_pov, cont.neighb)
+summary(sp.err.model, Nagelkerke = TRUE)
+#Where Lambda is the error multiplier
+```
+
+Wow, none of the log variables are significant, but this model sure does have a great R<sup>2</sup> value (0.641)! To test the validity of this model, we will run a Spatial Hausman Test
+
+```{r hausman test, message=FALSE, warning=FALSE, echo=TRUE}
+Hausman<-spatialreg::Hausman.test(sp.err.model)
+```
+
+Because we got a nonsignificant result for our Hausman Test, we fail to reject the null hypothesis that the estimation method yielded coefficients appropriate for a spatial error model. This supports the use of this model.
+
+## Spatial Error Durbin Model
+
+```{r nested models, message=FALSE, warning=FALSE, echo=TRUE}
+sd.err <- spatialreg::errorsarlm(equation, fl_pov, cont.neighb, etype = "emixed")
+sdm <- spatialreg::lagsarlm(equation, fl_pov, cont.neighb, type = "mixed")
+```
+
+```{r sderr summary, message=FALSE, warning=FALSE, echo=TRUE}
+summary(sd.err, Nagelkerke = TRUE)
+```
+
+Wow, our R<sup>2</sup> value went up to 0.75, but our p-value is nonsignificant. 
+
+```{r sderr model Impacts, message=FALSE, warning=FALSE}
+summary(spatialreg::impacts(sd.err, listw = cont.neighb, R = 100), zstats = TRUE)[["pzmat"]]
+```
+
+## Selecting a Model
+
+Following up with an impact analysis, only lnretail and lnhealthss are significant. Given this, we will compare the Spatial Error Model with the Spatial Error Durbin Model (mixed model).
+
+```{r sder vs sperr lr test, message=FALSE, warning=FALSE, echo=TRUE}
+spatialreg::LR.sarlm(sd.err,sp.err.model)
+#Where our df is equal to the number of lagged variables
+```
+
+We fail to reject the null hypothesis (p= `r round(spatialreg::LR.sarlm(sd.err,sp.err.model)[["p.value"]],4)`), meaning that we should restrict the model to a spatial error model. 
+
+Additionally, the spatial error model should be utilized because it is significantly different from the OLS (p=
+(p= `r round(spatialreg::LR.sarlm(sd.err,ols)[["p.value"]],4)`), meaning that we should not restrict this analysis to the OLS only.
+
+# K-Nearest Neighbors
+
+```{r centroids, message=FALSE, warning=FALSE, echo=TRUE}
+all.xy <- centroid(fl_sp)
+#tx_IDs <- unique(tx_fips$fips) this value was created in the contiguity section but would be needed here if only using distance functions. See "creating list of contiguity neighbors" for details.
+rownames(all.xy) <- fl_IDs
+colnames(all.xy) <- cbind("x","y")
+```
+
+```{r k-distance list, message=FALSE, warning=FALSE, echo=TRUE}
+#Create neighbors
+all.dist.k1 <- knn2nb(knearneigh(all.xy, k=1, longlat = TRUE))
+all.dist.k3 <- knn2nb(knearneigh(all.xy, k=3, longlat = TRUE))
+all.dist.k5 <- knn2nb(knearneigh(all.xy, k=5, longlat = TRUE))
+
+#Determine max k distance value to neighbor
+all.max.k1 <- max(unlist(nbdists(all.dist.k1, all.xy, longlat=TRUE)))
+all.max.k3 <- max(unlist(nbdists(all.dist.k3, all.xy, longlat=TRUE)))
+all.max.k5 <- max(unlist(nbdists(all.dist.k5, all.xy, longlat=TRUE)))
+
+#Calculate neighbors based on distance
+all.sp.dist.k1 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k1, longlat = TRUE)
+all.sp.dist.k3 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k3, longlat = TRUE)
+all.sp.dist.k5 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k5, longlat = TRUE)
+
+#Create neighbor list
+all.dist.neighb.k1 <- nb2listw(all.sp.dist.k1,style="W", zero.policy = TRUE)
+all.dist.neighb.k3 <- nb2listw(all.sp.dist.k3,style="W", zero.policy = TRUE)
+all.dist.neighb.k5 <- nb2listw(all.sp.dist.k5,style="W", zero.policy = TRUE)
+```
+
+## Distance Lag Model
+
+```{r dist lag models, message=FALSE, warning=FALSE, echo=TRUE}
+all.dist.lag.k1 <- lagsarlm(equation, data = fl_pov, listw = all.dist.neighb.k1)
+all.dist.lag.k3 <- lagsarlm(equation, data = fl_pov, listw = all.dist.neighb.k3)
+all.dist.lag.k5 <- lagsarlm(equation, data = fl_pov, listw = all.dist.neighb.k5)
+```
+
+For this example we will only view the summary for the K=1 lag model:
+```{r k1 lag summary, message=FALSE, warning=FALSE, echo=TRUE}
+summary(all.dist.lag.k5, Nagelkerke = TRUE)
+```
+
+## Distance Error Model
+
+```{r dist err models, message=FALSE, warning=FALSE, echo=TRUE}
+all.dist.err.k1 <- errorsarlm(equation, data = fl_pov, listw = all.dist.neighb.k1)
+all.dist.err.k3 <- errorsarlm(equation, data = fl_pov, listw = all.dist.neighb.k3)
+all.dist.err.k5 <- errorsarlm(equation, data = fl_pov, listw = all.dist.neighb.k5)
+```
+
+```{r k1 err summary, message=FALSE, warning=FALSE, echo=TRUE}
+summary(all.dist.err.k5, Nagelkerke = TRUE)
+```
+
+## Selecting a Model...Again
+
+Distance | Lag   | Model  | Distance |   Err | Model  |
+-----    | ----- | ------ |-----     | ----- | ------ |
+*R<sup>2</sup>* |   *p-value* |   *AIC*  | *R<sup>2</sup>*  |  *p-value*  |   *AIC*  |
+0.603 | 0.318 | 445.75 | 0.630 | 0.0176 | 441.11 | 
+
+Because the Distance Lag Model is not significant, and because it has a lower R<sup>2</sup value, we will use the Distance Error Model.
+
+```{r mapping data, message=FALSE, warning=FALSE, echo=TRUE}
+dist.err.data <- summary(all.dist.err.k5, correlation=TRUE, Nagelkerke = TRUE)
+
+dist.err.output <- cbind.data.frame(fl_pov$FIPS,
+                               dist.err.data$fitted.values, 
+                               dist.err.data$residual, 
+                               fl_pov$child.pov.2016, 
+                               fl_pov$lnincome_ratio, 
+                               fl_pov$lnconstruction, 
+                               fl_pov$lnlesshs, 
+                               fl_pov$lnuninsured,
+                               stringsAsFactors = FALSE)
+
+#Renaming columns
+colnames(dist.err.output) <- c("fips","fitted","resid","childpov",
+                               "income_ratio","construction","less_hs","uninsured")
+```
+
+# Mapping the Model
+
+```{r quant and rank, message=FALSE, warning=FALSE, echo=TRUE}
+#Create quantiles
+quantiles_sm <- dist.err.output %>%
+  pull(income_ratio) %>%
+  quantile(probs = seq(0, 1, length.out = 4), na.rm = TRUE)
+
+quantiles_pov <- dist.err.output %>%
+  pull(childpov) %>%
+  quantile(probs = seq(0, 1, length.out = 4), na.rm = TRUE)
+
+#Create ranks
+sm_rank <- cut(dist.err.output$income_ratio, 
+               breaks= quantiles_sm, 
+               labels=c("1", "2", "3"), 
+               na.rm = TRUE, 
+               include.lowest = TRUE)
+
+pov_rank <- cut(dist.err.output$childpov, 
+                breaks= quantiles_pov, 
+                labels=c("1", "2", "3"), 
+                na.rm = TRUE,
+                include.lowest = TRUE)
+
+#Join ranks and combined column to dataset
+dist.err.output$inc_score <- as.numeric(sm_rank)
+dist.err.output$pov_score <- as.numeric(pov_rank)
+dist.err.output$inc_pov <- paste(as.numeric(dist.err.output$pov_score), 
+                         "-", 
+                         as.numeric(dist.err.output$inc_score))
+```
+
+```{r bivariate legend, message=FALSE, warning=FALSE, echo=TRUE}
+legend_colors <- tibble(
+  x = c(3,2,1,3,2,1,3,2,1),
+  y = c(3,3,3,2,2,2,1,1,1),
+  z = c("#574249", "#627f8c", "#64acbe", "#985356", "#ad9ea5", "#b0d5df", "#c85a5a", "#e4acac", "#e8e8e8"))
+
+xlabel <- "Poverty,Low \u2192 High"
+xlabel <- gsub(",", "\n", xlabel)
+ylabel <- "Income Ratio,Low \u2192 High"
+ylabel <- gsub(",", "\n", ylabel)
+
+legend <- ggplot(legend_colors, aes(x,y)) + 
+  geom_tile(aes(fill=z)) + 
+  theme_minimal() + theme(legend.position = "none") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) +
+  labs(x = xlabel, y = ylabel) + 
+  scale_fill_identity() +
+  ggtitle("Legend") +
+  theme(axis.title.y = element_text(face = "italic", hjust = 0.5, size = 8)) +
+  theme(axis.title.x = element_text(face = "italic", hjust = 0.5, size = 8)) +
+  theme(plot.title = element_text(face="bold", hjust = 0.5, size = 10))
+```
+
+```{r create mapping polygons, message=FALSE, warning=FALSE, echo=TRUE}
+world <- map_data("world")
+states <- map_data("state")
+counties <- map_data("county")
+
+counties$polyname <- paste(counties$region, counties$subregion, sep = ",")
+counties <- counties %>% left_join(fips, by = c("polyname" = "polyname"))
+counties$fips <- as.character(counties$fips)
+counties <- counties %>% left_join(fl_pov, by = c("fips" = "FIPS"))
+
+southern_states <- subset(states, region %in% 
+                            c("texas", "arkansas", "louisiana", "mississippi", 
+                              "alabama", "georgia", "florida", "north carolina",
+                              "south carolina", "tennessee", "oklahoma", 
+                              "kentucky", "west virginia", "virginia", 
+                              "maryland", "delaware", "district of columbia"))
+
+southern_counties <- subset(counties, region %in% 
+                              c("texas", "arkansas", "louisiana", "mississippi", 
+                                "alabama", "georgia", "florida", "north carolina",
+                                "south carolina", "tennessee", "oklahoma", 
+                                "kentucky", "west virginia", "virginia", 
+                                "maryland", "delaware", "district of columbia"))
+
+florida_counties <- subset(southern_counties, region == "florida")
+```
+
+```{r attach data to map, message=FALSE, warning=FALSE, echo=TRUE, results='hide'}
+#Attach the data via the FIPS column and fortify the polygon
+fl_poly <- florida_counties %>% 
+  left_join(dist.err.output, by = c("fips" = "fips")) %>%
+  fortify
+
+#Add custom color scheme based on ranks
+bivariate_color_scale <- tibble(
+  "3 - 3" = "#574249", 
+  "2 - 3" = "#627f8c",
+  "1 - 3" = "#64acbe",
+  "3 - 2" = "#985356",
+  "2 - 2" = "#ad9ea5",
+  "1 - 2" = "#b0d5df",
+  "3 - 1" = "#c85a5a",
+  "2 - 1" = "#e4acac",
+  "1 - 1" = "#e8e8e8") %>%
+  gather("group", "fill")
+
+fl_poly <- fl_poly %>% 
+  left_join(bivariate_color_scale, by = c("inc_pov" = "group"))
+```
+
+```{r bivariate map, message=FALSE, warning=FALSE, include=FALSE, results='hide'}
+inc_pov_map <- ggplot() + 
+  geom_polygon(data = world, aes(x=long,y=lat, group=group), fill = "gray95", color = "white") +
+  geom_polygon(data = states, aes(x=long,y=lat, group=group), fill = "gray", color = "white") +
+  geom_polygon(data = fl_poly, aes(x=long, y=lat, group=group, fill = fill)) + 
+  geom_polygon(data = southern_states, aes(x=long,y=lat, group=group), fill = NA, color = "white") +
+  geom_polygon(data = florida_counties, aes(x=long,y=lat, group=group), fill = NA, color = "black", size = 0.05) +
+  coord_map("conic", lat0 = 30, xlim=c(-90,-78), ylim=c(23,32)) +
+  scale_fill_identity() +
+  theme_grey() + theme(legend.position="bottom") + theme(legend.title.align=0.5) +
+  theme(panel.background = element_rect(fill = 'deepskyblue'),
+        panel.grid.major = element_line(colour = NA)) +
+  labs(x = "Longitude", y = "Latitude", fill = "Child Poverty", 
+       title = "Bivariate Map of Child Poverty and Income Ratio") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+inc_pov_map
+```
+
+```{r fina map, message=FALSE, warning=FALSE, echo=TRUE}
+final_map <- ggdraw() +
+  draw_plot(inc_pov_map, x = 0, y = 0, width = 1, height = 1) +
+  draw_plot(legend, x = 0.25, y = 0.15, width = 0.2, height = 0.35) 
+
+final_map
+```
+
+
+
+
+
+
+
+
+
